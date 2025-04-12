@@ -100,16 +100,32 @@ def handle_stream_response(response):
                     
                     if line == "data: [DONE]":
                         print("\n===== 接收到完成标记 [DONE] =====\n")
-                        # 确保立即发送完成标记
+                        # 直接转发[DONE]标记而不尝试解析
                         yield "data: [DONE]\n\n"
                         # 强制刷新缓冲区
                         await asyncio.sleep(0)
+                        # 设置标志位表示已处理过[DONE]
+                        done_processed = True
+                        continue
+                    
+                    # 如果已经处理过[DONE]标记，则跳过后续所有[DONE]
+                    if hasattr(generate, 'done_processed') and generate.done_processed:
+                        print("[跳过重复的DONE标记]")
                         continue
                     
                     try:
+                        # 检查是否存在双重data:前缀
+                        content = line
+                        if line.startswith("data: data:"):
+                            print(f"[检测到双重data:前缀] 原始: {line}")
+                            # 使用正则表达式精确匹配并去除多余的data:前缀
+                            import re
+                            content = re.sub(r'^data:\s*data:', 'data:', line)
+                            print(f"[处理后] {content}")
+                        
                         # 直接转发SSE行，不尝试解析JSON
                         # 确保行以data:开头并以\n\n结尾
-                        formatted_response = f"{line}\n\n"
+                        formatted_response = f"{content}\n\n"
                         print(f"[直接转发SSE行] {formatted_response!r}")
                         # 立即发送数据，不等待整个响应完成
                         yield formatted_response
@@ -173,14 +189,76 @@ async def handle_non_stream_response(response):
                 
                 try:
                     # 提取SSE行中的JSON数据
-                    json_str = line[6:]  # 去掉 "data: " 前缀
-                    data = json.loads(json_str)
-                    if "choices" in data and len(data["choices"]) > 0:
-                        delta = data["choices"][0].get("delta", {})
-                        content = delta.get("content", "")
-                        full_content += content
-                        # 强制刷新缓冲区
-                        await asyncio.sleep(0)
+                    import re
+                    json_str = re.sub(r'^data:\s*', '', line)  # 使用正则去掉data:前缀
+                    
+                    # 检查是否存在双重data:前缀
+                    if json_str.startswith("data:"):
+                        print(f"[检测到双重data:前缀] 原始: {json_str}")
+                        json_str = re.sub(r'^data:\s*', '', json_str)  # 再次使用正则去掉data:前缀
+                        print(f"[处理后原始] {json_str}")
+                        
+                        # 如果是[DONE]标记则跳过
+                        if json_str.strip() == "[DONE]":
+                            continue
+                            
+                        # 修复JSON格式：确保是有效的JSON字符串
+                        # 检查是否缺少开头的花括号
+                        if not json_str.strip().startswith("{"):
+                            # 构建完整的JSON对象
+                            json_str = '{' + json_str
+                        
+                        # 检查是否缺少结尾的花括号
+                        if not json_str.strip().endswith("}"):
+                            json_str = json_str + "}"
+                            
+                        print(f"[处理后最终] {json_str}")
+                    
+                    # 确保JSON字符串是有效的，处理可能的格式问题
+                    json_str = json_str.strip()
+                    if json_str.endswith("]"): # 处理特殊情况如 "DONE]"
+                        if json_str == "DONE]":
+                            print("[跳过无效JSON] DONE]")
+                            continue
+                        
+                        # 处理不完整的JSON响应
+                        if json_str.startswith("{") and not json_str.endswith("}"):
+                            # 尝试补全JSON
+                            json_str = json_str + "}"
+                            print(f"[修复不完整JSON] 补全后: {json_str}")
+                    
+                    try:
+                        # 尝试解析JSON
+                        data = json.loads(json_str)
+                        if "choices" in data and len(data["choices"]) > 0:
+                            delta = data["choices"][0].get("delta", {})
+                            content = delta.get("content", "")
+                            full_content += content
+                            # 强制刷新缓冲区
+                            await asyncio.sleep(0)
+                    except json.JSONDecodeError as json_err:
+                        print(f"[JSON解析错误] {json_err} - 尝试修复并重新解析")
+                        try:
+                            # 尝试修复常见的JSON格式问题
+                            # 移除可能导致问题的字符
+                            json_str = json_str.strip()
+                            # 如果字符串不是以{开头，尝试找到第一个{并从那里开始
+                            if not json_str.startswith("{"):
+                                start_idx = json_str.find("{")
+                                if start_idx >= 0:
+                                    json_str = json_str[start_idx:]
+                            
+                            # 尝试再次解析
+                            data = json.loads(json_str)
+                            if "choices" in data and len(data["choices"]) > 0:
+                                delta = data["choices"][0].get("delta", {})
+                                content = delta.get("content", "")
+                                full_content += content
+                                # 强制刷新缓冲区
+                                await asyncio.sleep(0)
+                        except json.JSONDecodeError:
+                            print(f"[JSON修复失败] 无法解析JSON: {json_str} - 跳过此行")
+                            continue
                 except Exception as e:
                     print(f"\n[处理非流式行时出错] 错误类型: {type(e).__name__}, 错误信息: {e}\n[问题数据] {line!r}")
                     continue
